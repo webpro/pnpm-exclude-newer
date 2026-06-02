@@ -158,12 +158,14 @@ const run = (args, cwd) => new Promise((resolve) => {
 });
 const genCode = await run(['install', '--lockfile-only', '--registry', registry], tmp);
 server.close();
-if (genCode !== 0) {
+const generated = join(tmp, 'pnpm-lock.yaml');
+if (genCode !== 0 || !existsSync(generated)) {
+  rmSync(tmp, { recursive: true, force: true });
   console.error('\npnpm-exclude-newer: resolution failed — an aged package likely needs a too-fresh dependency (see error above).');
   process.exit(1);
 }
 
-copyFileSync(join(tmp, 'pnpm-lock.yaml'), join(ROOT, 'pnpm-lock.yaml'));
+copyFileSync(generated, join(ROOT, 'pnpm-lock.yaml'));
 rmSync(tmp, { recursive: true, force: true });
 console.error('pnpm-exclude-newer: lockfile written.');
 

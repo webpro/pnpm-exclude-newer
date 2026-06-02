@@ -25,6 +25,24 @@ Related pnpm issues:
 [#11203](https://github.com/pnpm/pnpm/issues/11203) (no intermediate fallback),
 [#10488](https://github.com/pnpm/pnpm/issues/10488) (excludes don't cascade).
 
+## How it compares
+
+Cooldown / min-release-age features that work at the **manifest or PR layer** only gate **direct**
+dependencies — your package manager still resolves the transitive tree to the freshest versions at
+install time:
+
+| Tool | Operates on | Direct | Transitive |
+| --- | --- | :---: | :---: |
+| [`npm-check-updates --cooldown`](https://github.com/raineorshine/npm-check-updates#cooldown) | rewrites `package.json` | ✅ | ❌ |
+| Renovate `minimumReleaseAge` / Dependabot cooldown | opens PRs | ✅ | ❌ |
+| pnpm [`minimumReleaseAge`](https://pnpm.io/settings#minimumreleaseage) | resolve + verify | ⚠️ `latest`-tag only | ❌ (errors) |
+| **`pnpm-exclude-newer`** | **registry resolution** | ✅ | ✅ |
+
+Verified: `ncu --cooldown 3` on a project with a single direct dependency correctly cools that
+dependency, yet its lockfile still contained a transitive dependency published 2 days earlier.
+`pnpm-exclude-newer` on the same project left zero entries younger than the cutoff. Only
+resolution-level filtering reaches transitive dependencies.
+
 ## How it works
 
 1. Stands up a throwaway local registry **mirror** that hides every version published on/after the
