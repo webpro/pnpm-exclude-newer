@@ -70,10 +70,23 @@ wait for it to age, or raise the cutoff for that run.
 ## Requirements & limitations
 
 - Node ≥ 18 (global `fetch`) and `pnpm` on `PATH`.
-- Reads the default registry and its `_authToken` from `npm config` / `.npmrc` (single registry).
-  Per-scope custom registries (`@scope:registry=`) aren't mirrored yet — those scopes fall back to
-  the default upstream.
-- It resolves with whatever `pnpm` is on `PATH`, not necessarily the repo's `packageManager` pin.
+- **pnpm version**: resolves with whatever `pnpm` is on `PATH` (under corepack, the repo's
+  `packageManager` pin — recommended for fidelity). A mismatch can change resolution; e.g. pnpm 11
+  ignores the `pnpm` field in `package.json`, so on an older repo that keeps
+  `overrides`/`patchedDependencies` there, run it under the matching pnpm.
+- **Registries**: only the default registry is mirrored (read with its `_authToken` from
+  `npm config` / `.npmrc`). Per-scope registries (`@scope:registry=`) bypass the mirror — those
+  scopes aren't age-filtered (and private ones may fail).
+- **Config fidelity**: the isolated install copies `package.json`(s), `pnpm-workspace.yaml`,
+  `.pnpmfile.cjs`/`pnpmfile.cjs`, and `patches/`. Resolution-affecting `.npmrc` settings
+  (e.g. `auto-install-peers`, `node-linker`) are not applied — keep them in `pnpm-workspace.yaml`.
+- `shared-workspace-lockfile=false` (per-package lockfiles) isn't supported.
+- **Non-registry deps** (git, tarball URL, `file:`, `link:`, `workspace:`) have no published-version
+  concept and aren't age-filtered — they resolve as usual.
+- If an `overrides` / catalog / `patchedDependencies` entry pins an *exact* version newer than the
+  cutoff, resolution fails (the mirror hides it) — age the pin or raise the cutoff.
+- `minimumReleaseAgeExclude` is not honored: everything is aged, no exceptions.
+- Versions the registry has no publish `time` for are treated as too-new (excluded).
 
 ## License
 

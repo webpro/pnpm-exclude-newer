@@ -6,7 +6,7 @@
 // `pnpm install` resolves a transitively age-capped tree.
 
 import http from 'node:http';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, cpSync, readdirSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { spawn, execSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -146,8 +146,23 @@ for (const f of manifests(ROOT)) {
   mkdirSync(join(dest, '..'), { recursive: true });
   copyFileSync(f, dest);
 }
-// drop the gate in the copy so resolution isn't blocked/biased while we build the lockfile
-if (ws) writeFileSync(join(tmp, 'pnpm-workspace.yaml'), ws.replace(/^\s*minimumReleaseAge:.*$/m, '').replace(/^\s*resolutionMode:.*$/m, ''));
+// also copy resolution-affecting files the manifest walk skips: pnpmfile hooks + patch files
+for (const f of ['.pnpmfile.cjs', 'pnpmfile.cjs']) {
+  if (existsSync(join(ROOT, f))) copyFileSync(join(ROOT, f), join(tmp, f));
+}
+if (existsSync(join(ROOT, 'patches'))) cpSync(join(ROOT, 'patches'), join(tmp, 'patches'), { recursive: true });
+for (const m of ws.matchAll(/([^\s'"]+\.patch)\b/g)) {
+  if (existsSync(join(ROOT, m[1])) && !existsSync(join(tmp, m[1]))) {
+    mkdirSync(join(tmp, m[1], '..'), { recursive: true });
+    copyFileSync(join(ROOT, m[1]), join(tmp, m[1]));
+  }
+}
+// neutralize only the policy keys that would block/bias generation (the mirror already enforces age);
+// keep other resolutionMode values and don't touch list-valued keys like minimumReleaseAgeExclude
+if (ws) writeFileSync(join(tmp, 'pnpm-workspace.yaml'), ws
+  .replace(/^\s*minimumReleaseAge:\s.*$/gm, '')
+  .replace(/^\s*minimumReleaseAgeStrict:\s.*$/gm, '')
+  .replace(/^\s*resolutionMode:\s*time-based\b.*$/gm, ''));
 
 // async spawn — spawnSync would block this process's event loop and starve the in-process mirror
 const win = process.platform === 'win32';
