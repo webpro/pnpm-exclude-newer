@@ -1,0 +1,36 @@
+{
+  "name": "pnpm-exclude-newer",
+  "version": "0.1.0",
+  "description": "Resolve a pnpm lockfile whose entire dependency tree (direct + transitive) excludes versions published after a cutoff — a transitive minimumReleaseAge / uv-style --exclude-newer for pnpm.",
+  "type": "module",
+  "bin": {
+    "pnpm-exclude-newer": "bin/cli.mjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "pnpm",
+    "minimumReleaseAge",
+    "exclude-newer",
+    "supply-chain",
+    "security",
+    "lockfile",
+    "time-based",
+    "resolution",
+    "cooldown"
+  ],
+  "author": "Lars Kappert <lars@webpro.nl>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webpro/pnpm-exclude-newer.git"
+  },
+  "homepage": "https://github.com/webpro/pnpm-exclude-newer#readme",
+  "bugs": {
+    "url": "https://github.com/webpro/pnpm-exclude-newer/issues"
+  }
+}

@@ -1,0 +1,173 @@
+#!/usr/bin/env node
+// pnpm-exclude-newer — resolve a pnpm lockfile whose ENTIRE tree (direct + transitive)
+// excludes versions published after a cutoff. Works around pnpm's `minimumReleaseAge`
+// being verify-only and `resolutionMode: time-based` being broken (pnpm #10257/#11068/#11203):
+// it stands up a throwaway registry mirror that hides too-new versions, so a normal
+// `pnpm install` resolves a transitively age-capped tree.
+
+import http from 'node:http';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, readdirSync, existsSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { spawn, execSync } from 'node:child_process';
+import { homedir } from 'node:os';
+
+const ROOT = process.cwd();
+const args = process.argv.slice(2);
+const has = (f) => args.includes(f);
+const val = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
+
+if (has('-h') || has('--help')) {
+  console.log(`pnpm-exclude-newer — resolve a transitively age-capped pnpm lockfile
+
+Usage (run from a pnpm project/workspace root):
+  pnpm-exclude-newer [--age <minutes>] [--exclude-newer <date>] [--no-install]
+
+  --exclude-newer <date>  hide versions published on/after <date> (e.g. 2026-05-30)
+  --age <minutes>         cutoff = now - <minutes>  (default: minimumReleaseAge from
+                          pnpm-workspace.yaml, else 1440 = 1 day)
+  --no-install            stop after writing the lockfile (skip the verifying install)
+  -h, --help              this message
+
+Why: pnpm's minimumReleaseAge only *verifies* (resolves latest-in-range, then rejects),
+and resolutionMode:time-based is broken, so neither yields a transitively-mature tree.
+This mirrors the registry minus too-new versions, resolves in an isolated copy of your
+manifests (your node_modules would otherwise leak fresh peers), writes the lockfile back,
+then runs a real install so pnpm's own gate verifies it.`);
+  process.exit(0);
+}
+
+// ---- cutoff ----
+const wsPath = join(ROOT, 'pnpm-workspace.yaml');
+const ws = existsSync(wsPath) ? readFileSync(wsPath, 'utf8') : '';
+let cutoff;
+if (val('--exclude-newer') !== undefined) {
+  cutoff = Date.parse(val('--exclude-newer'));
+  if (Number.isNaN(cutoff)) { console.error(`pnpm-exclude-newer: invalid --exclude-newer date: ${val('--exclude-newer')}`); process.exit(1); }
+} else {
+  const age = Number(val('--age') ?? ws.match(/^\s*minimumReleaseAge:\s*(\d+)/m)?.[1] ?? 1440);
+  cutoff = Date.now() - age * 60000;
+}
+
+if (!existsSync(join(ROOT, 'package.json')) && !ws) {
+  console.error('pnpm-exclude-newer: run from a pnpm project root (no package.json or pnpm-workspace.yaml found).');
+  process.exit(1);
+}
+
+// ---- upstream registry + auth (respect npm config / .npmrc) ----
+let upstream = 'https://registry.npmjs.org';
+try { const r = execSync('npm config get registry', { encoding: 'utf8' }).trim(); if (/^https?:\/\//.test(r)) upstream = r.replace(/\/$/, ''); } catch {}
+function authHeader(regUrl) {
+  const host = new URL(regUrl).host;
+  const files = [join(ROOT, '.npmrc'), process.env.NPM_CONFIG_USERCONFIG, join(homedir(), '.npmrc')].filter((f) => f && existsSync(f));
+  for (const f of files) {
+    for (const line of readFileSync(f, 'utf8').split('\n')) {
+      const m = line.match(/^\/\/([^/]+)\/.*?:_authToken=(.+?)\s*$/);
+      if (m && m[1] === host) {
+        const tok = m[2].replace(/^["']|["']$/g, '').replace(/\$\{([^}]+)\}/g, (_, n) => process.env[n] ?? '').trim();
+        if (tok) return { authorization: `Bearer ${tok}` };
+      }
+    }
+  }
+  return {};
+}
+const upstreamAuth = authHeader(upstream);
+
+// ---- minimal semver (compare + prerelease test), no deps ----
+const valid = (v) => /^\d+\.\d+\.\d+/.test(v);
+const stable = (v) => !v.includes('-');
+const cmp = (a, b) => {
+  const pa = a.split('+')[0].split('-'), pb = b.split('+')[0].split('-');
+  const na = pa[0].split('.').map(Number), nb = pb[0].split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((na[i] || 0) !== (nb[i] || 0)) return (na[i] || 0) - (nb[i] || 0);
+  if (pa[1] && !pb[1]) return -1;
+  if (!pa[1] && pb[1]) return 1;
+  return (pa[1] ?? '') < (pb[1] ?? '') ? -1 : (pa[1] ?? '') > (pb[1] ?? '') ? 1 : 0;
+};
+
+// ---- time-machine registry mirror ----
+const cache = new Map();
+async function filtered(urlPath) {
+  if (cache.has(urlPath)) return cache.get(urlPath);
+  const res = await fetch(upstream + urlPath, { headers: { accept: 'application/json', ...upstreamAuth } });
+  if (!res.ok) return { status: res.status };
+  const p = await res.json();
+  const time = p.time ?? {};
+  const versions = {};
+  for (const [v, meta] of Object.entries(p.versions ?? {})) {
+    const t = time[v];
+    if (valid(v) && t && Date.parse(t) < cutoff) versions[v] = meta;
+  }
+  const ntime = {};
+  for (const [k, v2] of Object.entries(time)) if (k === 'created' || k === 'modified' || versions[k]) ntime[k] = v2;
+  p.versions = versions;
+  p.time = ntime;
+  const keys = Object.keys(versions);
+  const pool = keys.filter(stable).length ? keys.filter(stable) : keys;
+  const latest = pool.sort(cmp).at(-1);
+  const tags = {};
+  if (latest) tags.latest = latest;
+  for (const [tag, v] of Object.entries(p['dist-tags'] ?? {})) if (tag !== 'latest' && versions[v]) tags[tag] = v;
+  p['dist-tags'] = tags;
+  const out = { status: 200, body: JSON.stringify(p) };
+  cache.set(urlPath, out);
+  return out;
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (req.url.includes('/-/')) { res.writeHead(302, { location: upstream + req.url }); return res.end(); } // tarball/attestation -> real registry
+    const r = await filtered(req.url);
+    if (r.status !== 200) { res.writeHead(r.status); return res.end(); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(req.method === 'HEAD' ? undefined : r.body);
+  } catch (e) { res.writeHead(502); res.end(String(e?.message ?? e)); }
+});
+
+// ---- isolated copy of the manifests (node_modules would leak fresh peer versions) ----
+function manifests(dir, out = []) {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === 'node_modules' || e.name === '.git' || e.name === 'dist' || e.name.startsWith('.')) continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) manifests(p, out);
+    else if (e.name === 'package.json') out.push(p);
+  }
+  return out;
+}
+
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const registry = `http://127.0.0.1:${port}`;
+console.error(`pnpm-exclude-newer: cutoff=${new Date(cutoff).toISOString()} upstream=${upstream} mirror=${registry}`);
+
+const tmp = join(process.env.TMPDIR ?? '/tmp', `pnpm-exclude-newer-${port}`);
+rmSync(tmp, { recursive: true, force: true });
+for (const f of manifests(ROOT)) {
+  const dest = join(tmp, relative(ROOT, f));
+  mkdirSync(join(dest, '..'), { recursive: true });
+  copyFileSync(f, dest);
+}
+// drop the gate in the copy so resolution isn't blocked/biased while we build the lockfile
+if (ws) writeFileSync(join(tmp, 'pnpm-workspace.yaml'), ws.replace(/^\s*minimumReleaseAge:.*$/m, '').replace(/^\s*resolutionMode:.*$/m, ''));
+
+// async spawn — spawnSync would block this process's event loop and starve the in-process mirror
+const win = process.platform === 'win32';
+const run = (args, cwd) => new Promise((resolve) => {
+  const c = spawn('pnpm', args, { cwd, stdio: 'inherit', shell: win });
+  c.on('close', (code) => resolve(code ?? 0));
+  c.on('error', () => resolve(1));
+});
+const genCode = await run(['install', '--lockfile-only', '--registry', registry], tmp);
+server.close();
+if (genCode !== 0) {
+  console.error('\npnpm-exclude-newer: resolution failed — an aged package likely needs a too-fresh dependency (see error above).');
+  process.exit(1);
+}
+
+copyFileSync(join(tmp, 'pnpm-lock.yaml'), join(ROOT, 'pnpm-lock.yaml'));
+rmSync(tmp, { recursive: true, force: true });
+console.error('pnpm-exclude-newer: lockfile written.');
+
+if (!has('--no-install')) {
+  console.error('pnpm-exclude-newer: verifying with a real install…');
+  process.exit(await run(['install'], ROOT));
+}
