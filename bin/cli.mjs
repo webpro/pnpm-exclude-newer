@@ -20,13 +20,19 @@ if (has('-h') || has('--help')) {
   console.log(`pnpm-exclude-newer — resolve a transitively age-capped pnpm lockfile
 
 Usage (run from a pnpm project/workspace root):
-  pnpm-exclude-newer [--age <minutes>] [--exclude-newer <date>] [--no-install]
+  pnpm-exclude-newer [--age <minutes>] [--exclude-newer <date>] [--no-bump] [--no-install]
 
   --exclude-newer <date>  hide versions published on/after <date> (e.g. 2026-05-30)
   --age <minutes>         cutoff = now - <minutes>  (default: minimumReleaseAge from
                           pnpm-workspace.yaml, else 1440 = 1 day)
+  --no-bump               don't touch package.json; only resolve the lockfile within
+                          the existing ranges
   --no-install            stop after writing the lockfile (skip the verifying install)
   -h, --help              this message
+
+By default each direct dep range is bumped to the latest *mature* version, keeping its
+^/~ operator; a floor too fresh to have a mature match (^1.69.0 when 1.68.0 is newest) is
+lowered. --no-bump skips the bump and only resolves the lockfile.
 
 Why: pnpm's minimumReleaseAge only *verifies* (resolves latest-in-range, then rejects),
 and resolutionMode:time-based is broken, so neither yields a transitively-mature tree.
@@ -113,6 +119,51 @@ async function filtered(urlPath) {
   return out;
 }
 
+// ---- bump direct deps to the latest mature version (preserving the ^/~ operator) ----
+// @types/node follows Node majors; even majors are LTS — track the newest LTS line, not current.
+const BUMP_CONSTRAINTS = { '@types/node': (v) => Number(v.split('.')[0]) % 2 === 0 };
+async function latestMature(name) {
+  const r = await filtered('/' + name.replace('/', '%2f')); // scoped: /@scope%2fname
+  if (r.status !== 200) return undefined;
+  let p; try { p = JSON.parse(r.body); } catch { return undefined; }
+  const ok = BUMP_CONSTRAINTS[name];
+  if (ok) {
+    const keys = Object.keys(p.versions ?? {}).filter(ok);
+    const pool = keys.filter(stable).length ? keys.filter(stable) : keys;
+    const pick = pool.sort(cmp).at(-1);
+    if (pick) return pick;
+  }
+  return p['dist-tags']?.latest;
+}
+const BUMP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies'];
+const SPEC = /^(\^|~)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$/; // skip workspace:/catalog:/file:/git/url/alias/* and complex ranges
+async function bumpManifests(paths) {
+  const bumps = [], snapshots = [];
+  for (const file of paths) {
+    const text = readFileSync(file, 'utf8');
+    let pkg; try { pkg = JSON.parse(text); } catch { continue; }
+    let changed = false;
+    for (const sec of BUMP_SECTIONS) {
+      for (const [name, cur] of Object.entries(pkg[sec] ?? {})) {
+        if (typeof cur !== 'string' || !SPEC.test(cur)) continue;
+        const latest = await latestMature(name);
+        if (!latest) continue;
+        const next = cur.replace(SPEC, (_, op) => (op ?? '') + latest);
+        if (next === cur) continue;
+        pkg[sec][name] = next;
+        bumps.push(`${name}  ${cur} → ${next}`);
+        changed = true;
+      }
+    }
+    if (changed) {
+      snapshots.push({ file, text });
+      const indent = text.match(/\n([ \t]+)\S/)?.[1] ?? '  ';
+      writeFileSync(file, JSON.stringify(pkg, null, indent) + (text.endsWith('\n') ? '\n' : ''));
+    }
+  }
+  return { bumps, snapshots };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.url.includes('/-/')) { res.writeHead(302, { location: upstream + req.url }); return res.end(); } // tarball/attestation -> real registry
@@ -139,9 +190,17 @@ const port = server.address().port;
 const registry = `http://127.0.0.1:${port}`;
 console.error(`pnpm-exclude-newer: cutoff=${new Date(cutoff).toISOString()} upstream=${upstream} mirror=${registry}`);
 
+const manifestPaths = manifests(ROOT);
+let snapshots = [];
+if (!has('--no-bump')) {
+  const r = await bumpManifests(manifestPaths);
+  snapshots = r.snapshots;
+  if (r.bumps.length) console.error(`pnpm-exclude-newer: bumped ${r.bumps.length} direct dep(s) to latest mature:\n  ${r.bumps.join('\n  ')}`);
+}
+
 const tmp = join(process.env.TMPDIR ?? '/tmp', `pnpm-exclude-newer-${port}`);
 rmSync(tmp, { recursive: true, force: true });
-for (const f of manifests(ROOT)) {
+for (const f of manifestPaths) {
   const dest = join(tmp, relative(ROOT, f));
   mkdirSync(join(dest, '..'), { recursive: true });
   copyFileSync(f, dest);
@@ -175,8 +234,9 @@ const genCode = await run(['install', '--lockfile-only', '--registry', registry]
 server.close();
 const generated = join(tmp, 'pnpm-lock.yaml');
 if (genCode !== 0 || !existsSync(generated)) {
+  for (const s of snapshots) writeFileSync(s.file, s.text);
   rmSync(tmp, { recursive: true, force: true });
-  console.error('\npnpm-exclude-newer: resolution failed — an aged package likely needs a too-fresh dependency (see error above).');
+  console.error(`\npnpm-exclude-newer: resolution failed${snapshots.length ? ' — reverted package.json bumps' : ''} (an aged package likely needs a too-fresh dependency; see error above).`);
   process.exit(1);
 }
 
