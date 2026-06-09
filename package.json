@@ -1,6 +1,6 @@
 {
-  "name": "pnpm-exclude-newer",
-  "version": "0.1.0",
+  "name": "@webpro/pnpm-exclude-newer",
+  "version": "1.0.0",
   "description": "Resolve a pnpm lockfile whose entire dependency tree (direct + transitive) excludes versions published after a cutoff — a transitive minimumReleaseAge / uv-style --exclude-newer for pnpm.",
   "type": "module",
   "bin": {
@@ -32,5 +32,8 @@
   "homepage": "https://github.com/webpro/pnpm-exclude-newer#readme",
   "bugs": {
     "url": "https://github.com/webpro/pnpm-exclude-newer/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
