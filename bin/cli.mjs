@@ -6,7 +6,7 @@
 // `pnpm install` resolves a transitively age-capped tree.
 
 import http from 'node:http';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, cpSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, cpSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { spawn, execSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -174,15 +174,20 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { res.writeHead(502); res.end(String(e?.message ?? e)); }
 });
 
-// ---- isolated copy of the manifests (node_modules would leak fresh peer versions) ----
-function manifests(dir, out = []) {
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    if (e.name === 'node_modules' || e.name === '.git' || e.name === 'dist' || e.name.startsWith('.')) continue;
-    const p = join(dir, e.name);
-    if (e.isDirectory()) manifests(p, out);
-    else if (e.name === 'package.json') out.push(p);
+// ---- workspace member manifests ----
+// Ask pnpm which dirs are real workspace members so we honor the packages globs (and their
+// negations) instead of walking every subdir — a naive recursion bumps test fixtures too.
+// No workspace file => single package, so the only manifest is the root.
+function manifests() {
+  if (!ws) return existsSync(join(ROOT, 'package.json')) ? [join(ROOT, 'package.json')] : [];
+  let members;
+  try {
+    members = JSON.parse(execSync('pnpm list -r --depth -1 --json', { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+  } catch {
+    console.error('pnpm-exclude-newer: could not enumerate workspace packages (`pnpm list -r --depth -1 --json` failed).');
+    process.exit(1);
   }
-  return out;
+  return members.map((m) => join(m.path, 'package.json')).filter(existsSync);
 }
 
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
@@ -190,7 +195,7 @@ const port = server.address().port;
 const registry = `http://127.0.0.1:${port}`;
 console.error(`pnpm-exclude-newer: cutoff=${new Date(cutoff).toISOString()} upstream=${upstream} mirror=${registry}`);
 
-const manifestPaths = manifests(ROOT);
+const manifestPaths = manifests();
 let snapshots = [];
 if (!has('--no-bump')) {
   const r = await bumpManifests(manifestPaths);

@@ -59,9 +59,11 @@ resolution-level filtering reaches transitive dependencies.
    **lowers** any whose floor is too fresh to have a mature match (e.g. `^1.69.0` → `^1.68.0`),
    which would otherwise error. Non-registry specs (`workspace:`, `catalog:`, `file:`, git, URL,
    `npm:` aliases, `*`, complex ranges) are left untouched.
-3. Copies the manifests into a clean temp tree (your `node_modules` would otherwise leak
-   fresh peer versions) and runs `pnpm install --lockfile-only` against the mirror — so pnpm's
-   _normal_ resolver produces a transitively age-capped tree.
+3. Copies the workspace-member manifests (asked from pnpm, so the `packages` globs and their
+   negations are honored — test fixtures and other nested `package.json`s are skipped) into a
+   clean temp tree (your `node_modules` would otherwise leak fresh peer versions) and runs
+   `pnpm install --lockfile-only` against the mirror — so pnpm's _normal_ resolver produces a
+   transitively age-capped tree.
 4. Copies the lockfile back and runs a real `pnpm install`, letting pnpm's own gate verify it.
 
 Real integrity hashes and tarballs come straight from the upstream registry, so the lockfile stays
