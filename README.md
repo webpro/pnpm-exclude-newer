@@ -61,13 +61,14 @@ resolution-level filtering reaches transitive dependencies.
    `npm:` aliases, `*`, complex ranges) are left untouched.
 3. Copies the workspace-member manifests (asked from pnpm, so the `packages` globs and their
    negations are honored — test fixtures and other nested `package.json`s are skipped) into a
-   clean temp tree (your `node_modules` would otherwise leak fresh peer versions) and runs
-   `pnpm install --lockfile-only` against the mirror — so pnpm's _normal_ resolver produces a
-   transitively age-capped tree.
-4. Copies the lockfile back and runs a real `pnpm install`, letting pnpm's own gate verify it.
+   clean temp tree (your `node_modules` would otherwise leak fresh peer versions), copies a sanitized
+   project `.npmrc`, and runs `pnpm install --lockfile-only` against the mirror — so pnpm's _normal_
+   resolver produces a transitively age-capped tree.
+4. Normalizes registry tarball URLs out of the generated lockfile, copies it back, and runs
+   `pnpm install --frozen-lockfile`, letting pnpm's own gate verify it without mutating the result.
 
-Real integrity hashes and tarballs come straight from the upstream registry, so the lockfile stays
-portable. If resolution fails, any `package.json` bumps from this run are reverted.
+Real integrity hashes come straight from the upstream registry, so the lockfile stays portable and
+keeps pnpm's usual shape. If resolution fails, any `package.json` bumps from this run are reverted.
 
 ## Options
 
@@ -89,12 +90,13 @@ wait for it to age, or raise the cutoff for that run.
   `packageManager` pin — recommended for fidelity). A mismatch can change resolution; e.g. pnpm 11
   ignores the `pnpm` field in `package.json`, so on an older repo that keeps
   `overrides`/`patchedDependencies` there, run it under the matching pnpm.
-- **Registries**: only the default registry is mirrored (read with its `_authToken` from
-  `npm config` / `.npmrc`). Per-scope registries (`@scope:registry=`) bypass the mirror — those
-  scopes aren't age-filtered (and private ones may fail).
+- **Registries**: only the default registry is mirrored (read with `pnpm config get registry`, with
+  its `_authToken` from `.npmrc`). Per-scope registries (`@scope:registry=`) are stripped from the
+  isolated install so the mirror remains in control; private scopes that need a different registry may
+  fail.
 - **Config fidelity**: the isolated install copies `package.json`(s), `pnpm-workspace.yaml`,
-  `.pnpmfile.cjs`/`pnpmfile.cjs`, and `patches/`. Resolution-affecting `.npmrc` settings
-  (e.g. `auto-install-peers`, `node-linker`) are not applied — keep them in `pnpm-workspace.yaml`.
+  `.pnpmfile.cjs`/`pnpmfile.cjs`, `patches/`, and non-registry project `.npmrc` settings. Registry,
+  auth, minimum-release-age, and `resolution-mode=time-based` entries are stripped in the temp tree.
 - `shared-workspace-lockfile=false` (per-package lockfiles) isn't supported.
 - **Non-registry deps** (git, tarball URL, `file:`, `link:`, `workspace:`) have no published-version
   concept and aren't age-filtered — they resolve as usual.

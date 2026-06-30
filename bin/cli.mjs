@@ -8,13 +8,17 @@
 import http from 'node:http';
 import { readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync, cpSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
+import semver from 'semver';
 
 const ROOT = process.cwd();
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
 const val = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
+const win = process.platform === 'win32';
+const PNPM = win ? 'pnpm.cmd' : 'pnpm';
+const NPM = win ? 'npm.cmd' : 'npm';
 
 if (has('-h') || has('--help')) {
   console.log(`pnpm-exclude-newer — resolve a transitively age-capped pnpm lockfile
@@ -38,7 +42,7 @@ Why: pnpm's minimumReleaseAge only *verifies* (resolves latest-in-range, then re
 and resolutionMode:time-based is broken, so neither yields a transitively-mature tree.
 This mirrors the registry minus too-new versions, resolves in an isolated copy of your
 manifests (your node_modules would otherwise leak fresh peers), writes the lockfile back,
-then runs a real install so pnpm's own gate verifies it.`);
+then runs a frozen install so pnpm's own gate verifies it.`);
   process.exit(0);
 }
 
@@ -61,7 +65,15 @@ if (!existsSync(join(ROOT, 'package.json')) && !ws) {
 
 // ---- upstream registry + auth (respect npm config / .npmrc) ----
 let upstream = 'https://registry.npmjs.org';
-try { const r = execSync('npm config get registry', { encoding: 'utf8' }).trim(); if (/^https?:\/\//.test(r)) upstream = r.replace(/\/$/, ''); } catch {}
+try {
+  const r = execFileSync(PNPM, ['config', 'get', 'registry'], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  if (/^https?:\/\//.test(r)) upstream = r.replace(/\/$/, '');
+} catch {
+  try {
+    const r = execFileSync(NPM, ['config', 'get', 'registry'], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (/^https?:\/\//.test(r)) upstream = r.replace(/\/$/, '');
+  } catch {}
+}
 function authHeader(regUrl) {
   const host = new URL(regUrl).host;
   const files = [join(ROOT, '.npmrc'), process.env.NPM_CONFIG_USERCONFIG, join(homedir(), '.npmrc')].filter((f) => f && existsSync(f));
@@ -78,20 +90,17 @@ function authHeader(regUrl) {
 }
 const upstreamAuth = authHeader(upstream);
 
-// ---- minimal semver (compare + prerelease test), no deps ----
-const valid = (v) => /^\d+\.\d+\.\d+/.test(v);
-const stable = (v) => !v.includes('-');
-const cmp = (a, b) => {
-  const pa = a.split('+')[0].split('-'), pb = b.split('+')[0].split('-');
-  const na = pa[0].split('.').map(Number), nb = pb[0].split('.').map(Number);
-  for (let i = 0; i < 3; i++) if ((na[i] || 0) !== (nb[i] || 0)) return (na[i] || 0) - (nb[i] || 0);
-  if (pa[1] && !pb[1]) return -1;
-  if (!pa[1] && pb[1]) return 1;
-  return (pa[1] ?? '') < (pb[1] ?? '') ? -1 : (pa[1] ?? '') > (pb[1] ?? '') ? 1 : 0;
+const valid = (v) => semver.valid(v) !== null;
+const stable = (v) => semver.prerelease(v) === null;
+const highest = (versions) => {
+  const validVersions = versions.filter(valid);
+  const pool = validVersions.filter(stable).length ? validVersions.filter(stable) : validVersions;
+  return pool.sort(semver.compare).at(-1);
 };
 
 // ---- time-machine registry mirror ----
 const cache = new Map();
+let registry;
 async function filtered(urlPath) {
   if (cache.has(urlPath)) return cache.get(urlPath);
   const res = await fetch(upstream + urlPath, { headers: { accept: 'application/json', ...upstreamAuth } });
@@ -101,15 +110,20 @@ async function filtered(urlPath) {
   const versions = {};
   for (const [v, meta] of Object.entries(p.versions ?? {})) {
     const t = time[v];
-    if (valid(v) && t && Date.parse(t) < cutoff) versions[v] = meta;
+    if (valid(v) && t && Date.parse(t) < cutoff) {
+      const next = { ...meta, dist: meta.dist ? { ...meta.dist } : meta.dist };
+      if (next.dist?.tarball) {
+        try { next.dist.tarball = registry + new URL(next.dist.tarball).pathname; } catch {}
+      }
+      versions[v] = next;
+    }
   }
   const ntime = {};
   for (const [k, v2] of Object.entries(time)) if (k === 'created' || k === 'modified' || versions[k]) ntime[k] = v2;
   p.versions = versions;
   p.time = ntime;
   const keys = Object.keys(versions);
-  const pool = keys.filter(stable).length ? keys.filter(stable) : keys;
-  const latest = pool.sort(cmp).at(-1);
+  const latest = highest(keys);
   const tags = {};
   if (latest) tags.latest = latest;
   for (const [tag, v] of Object.entries(p['dist-tags'] ?? {})) if (tag !== 'latest' && versions[v]) tags[tag] = v;
@@ -129,8 +143,7 @@ async function latestMature(name) {
   const ok = BUMP_CONSTRAINTS[name];
   if (ok) {
     const keys = Object.keys(p.versions ?? {}).filter(ok);
-    const pool = keys.filter(stable).length ? keys.filter(stable) : keys;
-    const pick = pool.sort(cmp).at(-1);
+    const pick = highest(keys);
     if (pick) return pick;
   }
   return p['dist-tags']?.latest;
@@ -182,7 +195,7 @@ function manifests() {
   if (!ws) return existsSync(join(ROOT, 'package.json')) ? [join(ROOT, 'package.json')] : [];
   let members;
   try {
-    members = JSON.parse(execSync('pnpm list -r --depth -1 --json', { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+    members = JSON.parse(execFileSync(PNPM, ['list', '-r', '--depth', '-1', '--json'], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
   } catch {
     console.error('pnpm-exclude-newer: could not enumerate workspace packages (`pnpm list -r --depth -1 --json` failed).');
     process.exit(1);
@@ -192,7 +205,7 @@ function manifests() {
 
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
-const registry = `http://127.0.0.1:${port}`;
+registry = `http://127.0.0.1:${port}`;
 console.error(`pnpm-exclude-newer: cutoff=${new Date(cutoff).toISOString()} upstream=${upstream} mirror=${registry}`);
 
 const manifestPaths = manifests();
@@ -221,6 +234,29 @@ for (const m of ws.matchAll(/([^\s'"]+\.patch)\b/g)) {
     copyFileSync(join(ROOT, m[1]), join(tmp, m[1]));
   }
 }
+function sanitizeNpmrc(text) {
+  return text.split(/\r?\n/).filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) return true;
+    const [rawKey, ...rawValue] = trimmed.split('=');
+    const key = rawKey.trim().toLowerCase();
+    const value = rawValue.join('=').trim().toLowerCase();
+    const authKeys = ['_auth', '_authtoken', '_password', 'username', 'email'];
+    if (key === 'registry' || key.endsWith(':registry')) return false;
+    if (authKeys.includes(key) || authKeys.some((authKey) => key.endsWith(`:${authKey}`))) return false;
+    if (key === 'minimum-release-age' || key === 'minimumreleaseage') return false;
+    if (key === 'minimum-release-age-strict' || key === 'minimumreleaseagestrict') return false;
+    if ((key === 'resolution-mode' || key === 'resolutionmode') && value === 'time-based') return false;
+    return true;
+  }).join('\n').replace(/\n*$/, '\n');
+}
+const tmpNpmrc = join(tmp, '.npmrc');
+if (existsSync(join(ROOT, '.npmrc'))) {
+  const npmrc = sanitizeNpmrc(readFileSync(join(ROOT, '.npmrc'), 'utf8'));
+  writeFileSync(tmpNpmrc, npmrc.trim() ? npmrc : '');
+} else {
+  writeFileSync(tmpNpmrc, '');
+}
 // neutralize only the policy keys that would block/bias generation (the mirror already enforces age);
 // keep other resolutionMode values and don't touch list-valued keys like minimumReleaseAgeExclude
 if (ws) writeFileSync(join(tmp, 'pnpm-workspace.yaml'), ws
@@ -229,13 +265,12 @@ if (ws) writeFileSync(join(tmp, 'pnpm-workspace.yaml'), ws
   .replace(/^\s*resolutionMode:\s*time-based\b.*$/gm, ''));
 
 // async spawn — spawnSync would block this process's event loop and starve the in-process mirror
-const win = process.platform === 'win32';
-const run = (args, cwd) => new Promise((resolve) => {
-  const c = spawn('pnpm', args, { cwd, stdio: 'inherit', shell: win });
+const run = (args, cwd, env = {}) => new Promise((resolve) => {
+  const c = spawn(PNPM, args, { cwd, env: { ...process.env, ...env }, stdio: 'inherit', shell: false });
   c.on('close', (code) => resolve(code ?? 0));
   c.on('error', () => resolve(1));
 });
-const genCode = await run(['install', '--lockfile-only', '--registry', registry], tmp);
+const genCode = await run(['install', '--lockfile-only', '--registry', registry, '--config.lockfile-include-tarball-url=false'], tmp, { NPM_CONFIG_USERCONFIG: tmpNpmrc });
 server.close();
 const generated = join(tmp, 'pnpm-lock.yaml');
 if (genCode !== 0 || !existsSync(generated)) {
@@ -245,11 +280,27 @@ if (genCode !== 0 || !existsSync(generated)) {
   process.exit(1);
 }
 
-copyFileSync(generated, join(ROOT, 'pnpm-lock.yaml'));
+function isRegistryTarball(value, registryOrigins) {
+  try { return registryOrigins.has(new URL(value).origin); } catch { return false; }
+}
+function normalizeLockfile(text, registryUrls) {
+  const registryOrigins = new Set(registryUrls.map((url) => new URL(url).origin));
+  return text.replace(/\bresolution:\s*\{([^}\n]*)\}/g, (match, body) => {
+    const fields = body.split(/,\s*/);
+    const kept = fields.filter((field) => {
+      const [key, ...value] = field.split(':');
+      if (key.trim() !== 'tarball') return true;
+      const tarball = value.join(':').trim().replace(/^['"]|['"]$/g, '');
+      return !isRegistryTarball(tarball, registryOrigins);
+    });
+    return `resolution: {${kept.join(', ')}}`;
+  });
+}
+writeFileSync(join(ROOT, 'pnpm-lock.yaml'), normalizeLockfile(readFileSync(generated, 'utf8'), [upstream, registry]));
 rmSync(tmp, { recursive: true, force: true });
 console.error('pnpm-exclude-newer: lockfile written.');
 
 if (!has('--no-install')) {
-  console.error('pnpm-exclude-newer: verifying with a real install…');
-  process.exit(await run(['install'], ROOT));
+  console.error('pnpm-exclude-newer: verifying with a frozen install…');
+  process.exit(await run(['install', '--frozen-lockfile'], ROOT));
 }
