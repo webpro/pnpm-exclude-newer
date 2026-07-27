@@ -53,11 +53,11 @@ lowered. minimumReleaseAgeExclude entries from pnpm config bypass the cutoff, in
 package patterns and exact-version selectors. --no-bump skips the bump and only resolves
 the lockfile.
 
-Why: pnpm's minimumReleaseAge only *verifies* (resolves latest-in-range, then rejects),
-and resolutionMode:time-based is broken, so neither yields a transitively-mature tree.
-This mirrors the registry minus too-new versions, resolves in an isolated copy of your
-manifests (your node_modules would otherwise leak fresh peers), writes the lockfile back,
-then runs a frozen install so pnpm's own gate verifies it.`);
+Why: pnpm's minimumReleaseAge does not reliably select the newest fully mature graph,
+and resolutionMode:time-based has unresolved interactions with the age policy. This
+mirrors the registry minus too-new versions, resolves in an isolated copy of your manifests
+(your node_modules would otherwise leak fresh peers), writes the lockfile back, then runs
+a frozen install so pnpm's own gate verifies it.`);
   process.exit(0);
 }
 
@@ -232,7 +232,9 @@ const highest = (versions) => {
 // ---- time-machine registry mirror ----
 const cache = new Map();
 const hiddenVersions = new Map();
+const rejectedVersions = new Set();
 const temporaryExclusions = new Set();
+const mirrorRegistries = [];
 let registry;
 const exactSelector = (name, version) => `${name}@${version}`;
 const packagePath = (name) => '/' + name.replace('/', '%2f');
@@ -247,14 +249,15 @@ async function filtered(urlPath) {
   for (const [v, meta] of Object.entries(p.versions ?? {})) {
     const t = time[v];
     const selector = exactSelector(p.name, v);
+    const rejected = rejectedVersions.has(selector);
     const excluded = isMinimumReleaseAgeExcluded(p.name, v) || temporaryExclusions.has(selector);
-    if (valid(v) && ((t && Date.parse(t) < cutoff) || excluded)) {
+    if (!rejected && valid(v) && ((t && Date.parse(t) < cutoff) || excluded)) {
       const next = { ...meta, dist: meta.dist ? { ...meta.dist } : meta.dist };
       if (next.dist?.tarball) {
         try { next.dist.tarball = registry + new URL(next.dist.tarball).pathname; } catch {}
       }
       versions[v] = next;
-    } else if (valid(v) && t && Date.parse(t) >= cutoff) {
+    } else if (!rejected && valid(v) && t && Date.parse(t) >= cutoff) {
       hiddenVersions.set(selector, { name: p.name, version: v, publishedAt: t });
     }
   }
@@ -288,13 +291,28 @@ async function latestAllowed(name, current) {
   const latest = ok ? highest(Object.keys(p.versions ?? {}).filter(ok)) : p['dist-tags']?.latest;
   return currentAllowed && (!latest || semver.gte(current, latest)) ? current : latest;
 }
+async function previousAllowed(name, current) {
+  const r = await filtered(packagePath(name));
+  if (r.status !== 200) return undefined;
+  let p; try { p = JSON.parse(r.body); } catch { return undefined; }
+  const ok = BUMP_CONSTRAINTS[name];
+  return highest(Object.keys(p.versions ?? {}).filter((version) => valid(version) && semver.lt(version, current) && (!ok || ok(version))));
+}
 const BUMP_SECTIONS = ['dependencies', 'devDependencies', 'optionalDependencies'];
 const SPEC = /^(\^|~)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$/; // skip workspace:/catalog:/file:/git/url/alias/* and complex ranges
+const parseManifest = (text) => {
+  try { return JSON.parse(text); } catch { return undefined; }
+};
+const writeManifest = (file, text, manifest) => {
+  const indent = text.match(/\n([ \t]+)\S/)?.[1] ?? '  ';
+  writeFileSync(file, JSON.stringify(manifest, null, indent) + (text.endsWith('\n') ? '\n' : ''));
+};
 async function bumpManifests(paths) {
   const bumps = [], snapshots = [];
   for (const file of paths) {
     const text = readFileSync(file, 'utf8');
-    let pkg; try { pkg = JSON.parse(text); } catch { continue; }
+    const pkg = parseManifest(text);
+    if (!pkg) continue;
     let changed = false;
     for (const sec of BUMP_SECTIONS) {
       for (const [name, cur] of Object.entries(pkg[sec] ?? {})) {
@@ -312,8 +330,7 @@ async function bumpManifests(paths) {
     }
     if (changed) {
       snapshots.push({ file, text });
-      const indent = text.match(/\n([ \t]+)\S/)?.[1] ?? '  ';
-      writeFileSync(file, JSON.stringify(pkg, null, indent) + (text.endsWith('\n') ? '\n' : ''));
+      writeManifest(file, text, pkg);
     }
   }
   return { bumps, snapshots };
@@ -328,6 +345,26 @@ const server = http.createServer(async (req, res) => {
     res.end(req.method === 'HEAD' ? undefined : r.body);
   } catch (e) { res.writeHead(502); res.end(String(e?.message ?? e)); }
 });
+const listenMirror = () => new Promise((resolve, reject) => {
+  const onError = (error) => {
+    server.off('listening', onListening);
+    reject(error);
+  };
+  const onListening = () => {
+    server.off('error', onError);
+    registry = `http://127.0.0.1:${server.address().port}`;
+    mirrorRegistries.push(registry);
+    resolve();
+  };
+  server.once('error', onError);
+  server.once('listening', onListening);
+  server.listen(0, '127.0.0.1');
+});
+const restartMirror = async () => {
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  cache.clear();
+  await listenMirror();
+};
 
 // ---- workspace member manifests ----
 // Ask pnpm which dirs are real workspace members so we honor the packages globs (and their
@@ -345,9 +382,8 @@ function manifests() {
   return members.map((m) => join(m.path, 'package.json')).filter(existsSync);
 }
 
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
+await listenMirror();
 const port = server.address().port;
-registry = `http://127.0.0.1:${port}`;
 console.error(`pnpm-exclude-newer: cutoff=${new Date(cutoff).toISOString()} upstream=${upstream} mirror=${registry}`);
 
 const manifestPaths = manifests();
@@ -367,7 +403,6 @@ if (!has('--no-bump')) {
   snapshots = r.snapshots;
   if (r.bumps.length) console.error(`pnpm-exclude-newer: bumped ${r.bumps.length} direct dep(s) to latest allowed:\n  ${r.bumps.join('\n  ')}`);
 }
-
 const tmp = join(process.env.TMPDIR ?? '/tmp', `pnpm-exclude-newer-${port}`);
 rmSync(tmp, { recursive: true, force: true });
 for (const f of manifestPaths) {
@@ -416,6 +451,49 @@ if (ws) writeFileSync(join(tmp, 'pnpm-workspace.yaml'), ws
   .replace(/^\s*minimumReleaseAgeStrict:\s.*$/gm, '')
   .replace(/^\s*resolutionMode:\s*time-based\b.*$/gm, ''));
 
+const hasDirectVersion = (name, version) => {
+  for (const file of manifestPaths) {
+    const manifest = parseManifest(readFileSync(file, 'utf8'));
+    if (!manifest) continue;
+    for (const section of BUMP_SECTIONS) {
+      const specifier = manifest[section]?.[name];
+      if (typeof specifier === 'string' && SPEC.test(specifier) && semver.satisfies(version, specifier, { includePrerelease: true })) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
+const findIntroducingDirect = (parents) => {
+  for (const parent of [...parents].reverse()) {
+    if (hasDirectVersion(parent.name, parent.version)) return parent;
+  }
+};
+const updateDirectVersion = (name, currentVersion, nextVersion) => {
+  const changes = [];
+  for (const file of manifestPaths) {
+    const text = readFileSync(file, 'utf8');
+    const manifest = parseManifest(text);
+    if (!manifest) continue;
+    let changed = false;
+    for (const section of BUMP_SECTIONS) {
+      const current = manifest[section]?.[name];
+      if (typeof current !== 'string') continue;
+      const match = SPEC.exec(current);
+      if (!match || !semver.satisfies(currentVersion, current, { includePrerelease: true })) continue;
+      const next = (match[1] ?? '') + nextVersion;
+      if (next === current) continue;
+      manifest[section][name] = next;
+      changes.push(`${name}  ${current} → ${next}`);
+      changed = true;
+    }
+    if (!changed) continue;
+    if (!snapshots.some((snapshot) => snapshot.file === file)) snapshots.push({ file, text });
+    writeManifest(file, text, manifest);
+    copyFileSync(file, join(tmp, relative(ROOT, file)));
+  }
+  return [...new Set(changes)];
+};
 const run = (args, cwd, env = {}) => new Promise((resolve) => {
   const c = spawn(PNPM, args, { cwd, env: { ...process.env, ...env }, stdio: 'inherit', shell: false });
   c.on('close', (code) => resolve(code ?? 1));
@@ -490,35 +568,64 @@ const runResolution = () => new Promise((resolve) => {
   child.on('close', finish);
   child.on('error', () => finish(1));
 });
-const blockers = [];
-const blockerSelectors = new Set();
-let resolution;
-while (true) {
+const runCleanResolution = async () => {
   rmSync(generated, { force: true });
   rmSync(join(tmp, 'node_modules'), { recursive: true, force: true });
-  resolution = await runResolution();
-  if (resolution.code === 0 && existsSync(generated)) break;
+  return runResolution();
+};
+const getImmatureExactBlocker = (resolution) => {
   const requested = resolution.error?.package;
   const version = valid(requested?.bareSpecifier) ? semver.valid(requested.bareSpecifier) : undefined;
   const selector = version && typeof requested?.name === 'string' ? exactSelector(requested.name, version) : undefined;
   const hidden = selector ? hiddenVersions.get(selector) : undefined;
-  if (!hidden || resolution.error?.code !== 'ERR_PNPM_NO_MATCHING_VERSION' || blockerSelectors.has(selector)) break;
+  if (!hidden || resolution.error?.code !== 'ERR_PNPM_NO_MATCHING_VERSION') return undefined;
   const parents = Array.isArray(resolution.error?.pkgsStack)
     ? resolution.error.pkgsStack.filter((parent) => typeof parent?.name === 'string' && typeof parent?.version === 'string')
     : [];
-  blockers.push({ ...hidden, parents });
-  blockerSelectors.add(selector);
-  temporaryExclusions.add(selector);
-  cache.delete(packagePath(hidden.name));
-}
-server.close();
-if (resolution.code !== 0 || !existsSync(generated)) {
+  return { ...hidden, selector, parents, introducingDirect: findIntroducingDirect(parents) };
+};
+const resolutionSucceeded = (resolution) => resolution.code === 0 && existsSync(generated);
+const failResolution = (resolution) => {
+  server.close();
   restoreRoot();
   rmSync(tmp, { recursive: true, force: true });
   const detail = resolution.error?.message ? `: ${resolution.error.message}` : '';
   console.error(`\npnpm-exclude-newer: resolution failed${detail}${snapshots.length ? ' — reverted package.json bumps' : ''}.`);
   process.exit(1);
+};
+const resolveWithMatureDirectFallbacks = async () => {
+  while (true) {
+    const resolution = await runCleanResolution();
+    if (resolutionSucceeded(resolution)) return resolution;
+    const blocker = getImmatureExactBlocker(resolution);
+    const introducingDirect = blocker?.introducingDirect;
+    if (!introducingDirect) return resolution;
+    const previous = await previousAllowed(introducingDirect.name, introducingDirect.version);
+    if (!previous) return resolution;
+    const changes = updateDirectVersion(introducingDirect.name, introducingDirect.version, previous);
+    if (!changes.length) return resolution;
+    const rejectedSelector = exactSelector(introducingDirect.name, introducingDirect.version);
+    rejectedVersions.add(rejectedSelector);
+    hiddenVersions.delete(rejectedSelector);
+    cache.delete(packagePath(introducingDirect.name));
+    console.error(`pnpm-exclude-newer: downgraded ${changes.join(', ')}; ${rejectedSelector} introduces immature ${blocker.selector}.`);
+  }
+};
+
+const blockers = [];
+const blockerSelectors = new Set();
+let resolution;
+while (true) {
+  resolution = await runCleanResolution();
+  if (resolutionSucceeded(resolution)) break;
+  const blocker = getImmatureExactBlocker(resolution);
+  if (!blocker || blockerSelectors.has(blocker.selector)) break;
+  blockers.push(blocker);
+  blockerSelectors.add(blocker.selector);
+  temporaryExclusions.add(blocker.selector);
+  cache.delete(packagePath(blocker.name));
 }
+if (!resolutionSucceeded(resolution)) failResolution(resolution);
 
 const formatDuration = (milliseconds) => {
   const minutes = Math.max(0, Math.ceil(milliseconds / 60000));
@@ -532,57 +639,79 @@ const pendingBlockers = blockers.filter((blocker) => Date.parse(blocker.publishe
 if (pendingBlockers.length) {
   console.error(`pnpm-exclude-newer: resolution requires ${pendingBlockers.length} immature exact-version exclusion(s):`);
   for (const blocker of pendingBlockers) {
-    const selector = exactSelector(blocker.name, blocker.version);
     const path = [...blocker.parents].reverse().map((parent) => exactSelector(parent.name, parent.version));
-    path.push(selector);
+    path.push(blocker.selector);
     const remaining = ageMinutes === undefined ? '' : `; matures in ${formatDuration(Date.parse(blocker.publishedAt) - currentCutoff())}`;
-    console.error(`  ${selector}\n    path: ${path.join(' → ')}\n    published: ${blocker.publishedAt}${remaining}`);
+    console.error(`  ${blocker.selector}\n    path: ${path.join(' → ')}\n    published: ${blocker.publishedAt}${remaining}`);
   }
 }
 if (pendingBlockers.length) {
   let confirmed = has('--yes');
-  if (!confirmed && process.stdin.isTTY && process.stderr.isTTY) {
+  const interactive = process.stdin.isTTY && process.stderr.isTTY;
+  if (!confirmed && interactive) {
+    console.error(has('--no-bump')
+      ? 'Choosing No will stop without changes because --no-bump disables direct fallbacks.'
+      : 'Choosing No will try older mature versions of the introducing direct dependencies.');
     const prompt = createInterface({ input: process.stdin, output: process.stderr });
     try {
-      const answer = await prompt.question('Add these exact exclusions to minimumReleaseAgeExclude and continue? [y/N] ');
+      const answer = await prompt.question('Add these exact exclusions to minimumReleaseAgeExclude and keep the current direct versions? [y/N] ');
       confirmed = /^(?:y|yes)$/i.test(answer.trim());
     } finally {
       prompt.close();
     }
   }
-  if (!confirmed) {
+  if (!confirmed && has('--no-bump')) {
+    server.close();
     restoreRoot();
     rmSync(tmp, { recursive: true, force: true });
-    const reason = process.stdin.isTTY && process.stderr.isTTY
+    const reason = interactive
       ? 'exact-version exclusions were not approved'
-      : 'non-interactive run cannot approve exact-version exclusions; rerun in a terminal';
+      : 'non-interactive run cannot approve exact-version exclusions and --no-bump disables direct fallbacks';
     console.error(`pnpm-exclude-newer: ${reason}.`);
     process.exit(1);
   }
-  let projectExclusions;
-  try {
-    projectExclusions = readPnpmConfig('minimumReleaseAgeExclude', ['--location=project']) ?? [];
-    if (!Array.isArray(projectExclusions) || projectExclusions.some((entry) => typeof entry !== 'string')) {
-      throw new Error('project minimumReleaseAgeExclude must be an array of strings');
+  if (confirmed) {
+    try {
+      const projectExclusions = readPnpmConfig('minimumReleaseAgeExclude', ['--location=project']) ?? [];
+      if (!Array.isArray(projectExclusions) || projectExclusions.some((entry) => typeof entry !== 'string')) {
+        throw new Error('project minimumReleaseAgeExclude must be an array of strings');
+      }
+      const additions = pendingBlockers.map((blocker) => blocker.selector);
+      const nextExclusions = [...new Set([...projectExclusions, ...additions])];
+      execFileSync(PNPM, [
+        'config',
+        'set',
+        '--location=project',
+        '--json',
+        'minimumReleaseAgeExclude',
+        JSON.stringify(nextExclusions),
+      ], { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'] });
+      console.error(`pnpm-exclude-newer: added exact exclusion(s): ${additions.join(', ')}`);
+    } catch (error) {
+      server.close();
+      restoreRoot();
+      rmSync(tmp, { recursive: true, force: true });
+      console.error(`pnpm-exclude-newer: could not update minimumReleaseAgeExclude: ${error.message}`);
+      process.exit(1);
     }
-    const additions = pendingBlockers.map((blocker) => exactSelector(blocker.name, blocker.version));
-    const nextExclusions = [...new Set([...projectExclusions, ...additions])];
-    execFileSync(PNPM, [
-      'config',
-      'set',
-      '--location=project',
-      '--json',
-      'minimumReleaseAgeExclude',
-      JSON.stringify(nextExclusions),
-    ], { cwd: ROOT, stdio: ['ignore', 'ignore', 'pipe'] });
-    console.error(`pnpm-exclude-newer: added exact exclusion(s): ${additions.join(', ')}`);
-  } catch (error) {
-    restoreRoot();
-    rmSync(tmp, { recursive: true, force: true });
-    console.error(`pnpm-exclude-newer: could not update minimumReleaseAgeExclude: ${error.message}`);
-    process.exit(1);
+  } else {
+    console.error('pnpm-exclude-newer: exact-version exclusions were not approved; trying mature direct dependency fallbacks.');
+    for (const blocker of pendingBlockers) {
+      temporaryExclusions.delete(blocker.selector);
+    }
+    try {
+      await restartMirror();
+    } catch (error) {
+      restoreRoot();
+      rmSync(tmp, { recursive: true, force: true });
+      console.error(`pnpm-exclude-newer: could not restart the registry mirror: ${error.message}`);
+      process.exit(1);
+    }
+    resolution = await resolveWithMatureDirectFallbacks();
+    if (!resolutionSucceeded(resolution)) failResolution(resolution);
   }
 }
+server.close();
 
 function isRegistryTarball(value, registryOrigins) {
   try { return registryOrigins.has(new URL(value).origin); } catch { return false; }
@@ -601,7 +730,7 @@ function normalizeLockfile(text, registryUrls) {
   });
 }
 try {
-  writeFileSync(lockfilePath, normalizeLockfile(readFileSync(generated, 'utf8'), [upstream, registry]));
+  writeFileSync(lockfilePath, normalizeLockfile(readFileSync(generated, 'utf8'), [upstream, ...mirrorRegistries]));
 } catch (error) {
   restoreRoot();
   rmSync(tmp, { recursive: true, force: true });

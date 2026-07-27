@@ -80,7 +80,7 @@ async function runFixture(t, options = {}) {
   await writeFile(
     fakePnpm,
     `#!/usr/bin/env node
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 const config = JSON.parse(process.env.FAKE_CONFIG);
 if (args[0] === 'config' && args[1] === 'get') {
@@ -99,8 +99,25 @@ if (args[0] === 'config' && args[1] === 'get') {
   if (process.env.FAKE_SILENT_RESOLUTION_FAILURE === '1') process.exit(1);
   const registry = args[args.indexOf('--registry') + 1];
   for (const blocker of JSON.parse(process.env.FAKE_BLOCKERS)) {
-    const metadata = await fetch(registry + '/' + blocker.name);
-    const packument = await metadata.json();
+    if (blocker.whenSpecifier) {
+      const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
+      const specifier = manifest.dependencies?.[blocker.whenSpecifier.name]
+        ?? manifest.devDependencies?.[blocker.whenSpecifier.name]
+        ?? manifest.optionalDependencies?.[blocker.whenSpecifier.name];
+      if (specifier !== blocker.whenSpecifier.value) continue;
+    }
+    const metadataUrl = registry + '/' + blocker.name;
+    let metadataCache = {};
+    try { metadataCache = JSON.parse(readFileSync('.fake-metadata-cache.json', 'utf8')); } catch {}
+    let packument = metadataCache[metadataUrl];
+    if (!packument) {
+      const metadata = await fetch(metadataUrl);
+      packument = await metadata.json();
+      if (packument.versions[blocker.version]) {
+        metadataCache[metadataUrl] = packument;
+        writeFileSync('.fake-metadata-cache.json', JSON.stringify(metadataCache));
+      }
+    }
     if (!packument.versions[blocker.version]) {
       const message = 'No matching version found for ' + blocker.name + '@' + blocker.version + ' while fetching it from ' + registry;
       console.log(JSON.stringify({
@@ -261,9 +278,115 @@ test('restores manifests when resolution fails without structured error output',
   assert.equal(result.lockfile, result.originalLockfile);
 });
 
-test('collects immature exact blockers and fails closed without confirmation', async (t) => {
+test('--yes keeps the direct version and approves its transitive exclusion', async (t) => {
   const result = await runFixture(t, {
     initialSpec: '^2.0.0',
+    args: ['--exclude-newer', '2026-07-25', '--yes'],
+    config: { minimumReleaseAgeExclude: ['example-package'] },
+    blockers: [{
+      name: 'fresh-transitive',
+      version: '3.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+      whenSpecifier: { name: 'example-package', value: '^2.0.0' },
+    }],
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.dependency, '^2.0.0');
+  assert.match(result.stderr, /resolution requires 1 immature exact-version exclusion/);
+  assert.doesNotMatch(result.stderr, /downgraded example-package/);
+  assert.match(result.workspace, /fresh-transitive@3\.0\.0/);
+});
+
+test('uses a mature direct fallback when the transitive exclusion is not approved', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    config: { minimumReleaseAgeExclude: ['example-package'] },
+    blockers: [{
+      name: 'fresh-transitive',
+      version: '3.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+      whenSpecifier: { name: 'example-package', value: '^2.0.0' },
+    }],
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.dependency, '^1.0.0');
+  assert.match(result.stderr, /resolution requires 1 immature exact-version exclusion/);
+  assert.match(result.stderr, /downgraded example-package  \^2\.0\.0 → \^1\.0\.0/);
+  assert.doesNotMatch(result.workspace, /fresh-transitive/);
+});
+
+test('--no-bump stops when the transitive exclusion is not approved', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    args: ['--exclude-newer', '2026-07-25', '--no-bump'],
+    config: { minimumReleaseAgeExclude: ['example-package'] },
+    blockers: [{
+      name: 'fresh-transitive',
+      version: '3.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+      whenSpecifier: { name: 'example-package', value: '^2.0.0' },
+    }],
+  });
+
+  assert.equal(result.code, 1);
+  assert.equal(result.dependency, '^2.0.0');
+  assert.match(result.stderr, /resolution requires 1 immature exact-version exclusion/);
+  assert.doesNotMatch(result.stderr, /downgraded example-package/);
+});
+
+test('restores an automatic graph downgrade when final verification fails', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    config: { minimumReleaseAgeExclude: ['example-package'] },
+    blockers: [{
+      name: 'fresh-transitive',
+      version: '3.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+      whenSpecifier: { name: 'example-package', value: '^2.0.0' },
+    }],
+    verify: true,
+    finalCode: 42,
+  });
+
+  assert.equal(result.code, 42);
+  assert.equal(result.dependency, '^2.0.0');
+  assert.equal(result.lockfile, result.originalLockfile);
+});
+
+test('restores the direct version when the exclusion is declined and no mature fallback exists', async (t) => {
+  const blocker = {
+    name: 'fresh-transitive',
+    version: '3.0.0',
+    publishedAt: '2026-07-27T00:00:00.000Z',
+  };
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    config: { minimumReleaseAgeExclude: ['example-package'] },
+    blockers: [
+      { ...blocker, whenSpecifier: { name: 'example-package', value: '^2.0.0' } },
+      {
+        ...blocker,
+        parents: [{ name: 'example-package', version: '1.0.0' }],
+        whenSpecifier: { name: 'example-package', value: '^1.0.0' },
+      },
+    ],
+  });
+
+  assert.equal(result.code, 1);
+  assert.equal(result.dependency, '^2.0.0');
+  assert.doesNotMatch(result.workspace, /fresh-transitive/);
+  assert.match(result.stderr, /resolution requires 1 immature exact-version exclusion/);
+  assert.match(result.stderr, /downgraded example-package  \^2\.0\.0 → \^1\.0\.0/);
+  assert.ok(result.stderr.indexOf('resolution requires') < result.stderr.indexOf('downgraded example-package'));
+  assert.equal(result.lockfile, result.originalLockfile);
+});
+
+test('fails closed when exclusions are declined and no mature fallback exists', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    versions: [{ version: '2.0.0', publishedAt: '2020-01-02T00:00:00.000Z' }],
     blockers: [{
       name: 'fresh-transitive',
       version: '3.0.0',
@@ -274,7 +397,8 @@ test('collects immature exact blockers and fails closed without confirmation', a
   assert.equal(result.code, 1);
   assert.match(result.stderr, /fresh-transitive@3\.0\.0/);
   assert.match(result.stderr, /example-package@2\.0\.0 → fresh-transitive@3\.0\.0/);
-  assert.match(result.stderr, /non-interactive/);
+  assert.match(result.stderr, /trying mature direct dependency fallbacks/);
+  assert.match(result.stderr, /resolution failed/);
   assert.doesNotMatch(result.workspace, /fresh-transitive/);
   assert.equal(result.dependency, '^2.0.0');
   assert.equal(result.lockfile, result.originalLockfile);
@@ -285,6 +409,7 @@ test('persists all confirmed exact blockers and completes resolution', async (t)
     initialSpec: '^2.0.0',
     args: ['--exclude-newer', '2026-07-25', '--yes'],
     config: { minimumReleaseAgeExclude: ['already-excluded'] },
+    versions: [{ version: '2.0.0', publishedAt: '2020-01-02T00:00:00.000Z' }],
     blockers: [
       {
         name: 'first-transitive',
@@ -329,6 +454,7 @@ test('does not offer a missing version that was not hidden by the age policy', a
 test('restores approved exclusions when final verification fails', async (t) => {
   const result = await runFixture(t, {
     args: ['--exclude-newer', '2026-07-25', '--yes'],
+    versions: [{ version: '2.0.0', publishedAt: '2020-01-02T00:00:00.000Z' }],
     blockers: [{
       name: 'fresh-transitive',
       version: '3.0.0',

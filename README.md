@@ -28,8 +28,9 @@ This command filters registry metadata before pnpm resolves the dependency graph
 1. Start a local registry mirror that hides versions published on or after the cutoff. Configured `minimumReleaseAgeExclude` package names, patterns, and exact versions remain visible.
 2. Update simple direct ranges unless `--no-bump` is set. An allowed current floor is never lowered just because it is above the upstream `latest` tag. A floor hidden by the cutoff is lowered to the newest allowed version.
 3. Resolve the workspace in a clean temporary directory. The copy includes workspace manifests, pnpm hooks, patches, and non-registry `.npmrc` settings.
-4. Collect exact dependencies that were hidden by the age filter but are required by the selected graph. Ask for approval before adding them to the project `minimumReleaseAgeExclude`.
-5. Remove mirror tarball URLs from the generated lockfile, copy it back, and run `pnpm install --frozen-lockfile`.
+4. If selected versions require hidden exact dependencies, collect them and ask before adding them to the project `minimumReleaseAgeExclude`. Approving keeps the selected direct versions.
+5. If the exclusions are not approved, try older versions of the introducing direct dependencies. Direct ranges are updated automatically when an older version produces a mature graph.
+6. Remove mirror tarball URLs from the generated lockfile, copy it back, and run `pnpm install --frozen-lockfile`.
 
 Package integrity hashes still come from the upstream registry. If resolution or final verification fails, the command restores the manifests, project configuration, and previous lockfile.
 
@@ -37,7 +38,7 @@ Package integrity hashes still come from the upstream registry. If resolution or
 
 Exclusions do not cascade. For example, excluding `release-it` allows its newest version, but not a fresh exact version of `undici` that it requires.
 
-The command resolves in its temporary workspace until it has collected every exact blocker, then prints the evidence:
+The command collects every hidden exact blocker and prints the evidence:
 
 ```text
 undici@7.29.0
@@ -45,7 +46,9 @@ undici@7.29.0
   published: 2026-07-24T12:52:58.701Z; matures in 6h 30m
 ```
 
-An interactive run asks once before adding the exact versions. Rejecting the prompt leaves the project unchanged. Non-interactive runs fail closed; pass `--yes` only after reviewing the reported versions and dependency paths.
+An interactive run asks once before adding the exact versions. Approving keeps the selected direct versions. Rejecting the prompt tries older mature versions of the introducing direct dependencies; this fallback does not require confirmation. If no mature graph resolves, the project is restored.
+
+Non-interactive runs behave like a rejected prompt and try the mature fallback. Pass `--yes` only after reviewing the reported versions and dependency paths. With `--no-bump`, rejecting or not answering the prompt stops without changes.
 
 Exact exclusions are not removed automatically after they mature. Remove entries that are no longer intentional; pnpm is [tracking a cleanup command][7].
 
