@@ -25,24 +25,45 @@ async function runFixture(t, options = {}) {
     { version: '1.0.0', publishedAt: '2020-01-01T00:00:00.000Z' },
     { version: '2.0.0', publishedAt: '2020-01-02T00:00:00.000Z' },
   ];
+  const blockers = options.blockers ?? [];
   const registry = http.createServer((request, response) => {
     const origin = `http://${request.headers.host}`;
+    const requestName = decodeURIComponent(request.url.slice(1));
+    const blocker = blockers.find(({ name }) => name === requestName);
+    const registryPackage = blocker ? {
+      name: blocker.name,
+      versions: blocker.available === false ? [] : [{
+        version: blocker.version,
+        publishedAt: blocker.publishedAt,
+      }],
+      latest: blocker.version,
+    } : requestName === packageName ? {
+      name: packageName,
+      versions,
+      latest: options.latest ?? versions.at(-1).version,
+      tags: options.tags,
+    } : undefined;
+    if (!registryPackage) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
     const packageVersions = {};
     const time = {};
-    for (const { version, publishedAt } of versions) {
+    for (const { version, publishedAt } of registryPackage.versions) {
       packageVersions[version] = {
-        name: packageName,
+        name: registryPackage.name,
         version,
-        dist: { tarball: `${origin}/${packageName}/-/${packageName}-${version}.tgz` },
+        dist: { tarball: `${origin}/${registryPackage.name}/-/${registryPackage.name}-${version}.tgz` },
       };
       time[version] = publishedAt;
     }
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({
-      name: packageName,
+      name: registryPackage.name,
       'dist-tags': {
-        latest: options.latest ?? versions.at(-1).version,
-        ...options.tags,
+        latest: registryPackage.latest,
+        ...registryPackage.tags,
       },
       versions: packageVersions,
       time,
@@ -69,9 +90,30 @@ if (args[0] === 'config' && args[1] === 'get') {
   } else if (value !== undefined) {
     process.stdout.write(args[2] === 'registry' && !args.includes('--json') ? value : JSON.stringify(value));
   }
+} else if (args[0] === 'config' && args[1] === 'set') {
+  const exclusions = JSON.parse(args.at(-1));
+  writeFileSync('pnpm-workspace.yaml', 'packages: []\\nminimumReleaseAgeExclude:\\n' + exclusions.map((entry) => '  - ' + entry).join('\\n') + '\\n');
 } else if (args[0] === 'list') {
   console.log(JSON.stringify([{ path: process.cwd() }]));
-} else if (args[0] === 'install' && args.includes('--lockfile-only')) {
+} else if (args[0] === '--reporter=ndjson' && args[1] === 'install' && args.includes('--lockfile-only')) {
+  if (process.env.FAKE_SILENT_RESOLUTION_FAILURE === '1') process.exit(1);
+  const registry = args[args.indexOf('--registry') + 1];
+  for (const blocker of JSON.parse(process.env.FAKE_BLOCKERS)) {
+    const metadata = await fetch(registry + '/' + blocker.name);
+    const packument = await metadata.json();
+    if (!packument.versions[blocker.version]) {
+      const message = 'No matching version found for ' + blocker.name + '@' + blocker.version + ' while fetching it from ' + registry;
+      console.log(JSON.stringify({
+        level: 'error',
+        name: 'pnpm',
+        code: 'ERR_PNPM_NO_MATCHING_VERSION',
+        package: { name: blocker.name, bareSpecifier: blocker.version, version: blocker.version },
+        pkgsStack: blocker.parents,
+        err: { name: 'pnpm', code: 'ERR_PNPM_NO_MATCHING_VERSION', message },
+      }));
+      process.exit(1);
+    }
+  }
   writeFileSync('pnpm-lock.yaml', process.env.FAKE_GENERATED_LOCKFILE);
 } else if (args[0] === 'install' && args.includes('--frozen-lockfile')) {
   process.exitCode = Number(process.env.FAKE_FINAL_CODE);
@@ -103,8 +145,13 @@ if (args[0] === 'config' && args[1] === 'get') {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
       FAKE_CONFIG: JSON.stringify(config),
+      FAKE_BLOCKERS: JSON.stringify(blockers.map((blocker) => ({
+        ...blocker,
+        parents: blocker.parents ?? [{ name: packageName, version: options.latest ?? versions.at(-1).version }],
+      }))),
       FAKE_FINAL_CODE: String(options.finalCode ?? 0),
       FAKE_GENERATED_LOCKFILE: 'lockfileVersion: "9.0"\ngenerated: true\n',
+      FAKE_SILENT_RESOLUTION_FAILURE: options.silentResolutionFailure ? '1' : '0',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -115,6 +162,7 @@ if (args[0] === 'config' && args[1] === 'get') {
     dependency: manifest.dependencies[packageName],
     lockfile: await readFile(join(fixture, 'pnpm-lock.yaml'), 'utf8'),
     originalLockfile,
+    workspace: await readFile(join(fixture, 'pnpm-workspace.yaml'), 'utf8'),
   };
 }
 
@@ -198,5 +246,99 @@ test('restores manifests and lockfile when final verification fails', async (t) 
 
   assert.equal(result.code, 42);
   assert.equal(result.dependency, '^1.0.0');
+  assert.equal(result.lockfile, result.originalLockfile);
+});
+
+test('restores manifests when resolution fails without structured error output', async (t) => {
+  const result = await runFixture(t, {
+    silentResolutionFailure: true,
+  });
+
+  assert.equal(result.code, 1);
+  assert.doesNotMatch(result.stderr, /TypeError/);
+  assert.match(result.stderr, /resolution failed/);
+  assert.equal(result.dependency, '^1.0.0');
+  assert.equal(result.lockfile, result.originalLockfile);
+});
+
+test('collects immature exact blockers and fails closed without confirmation', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    blockers: [{
+      name: 'fresh-transitive',
+      version: '3.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+    }],
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /fresh-transitive@3\.0\.0/);
+  assert.match(result.stderr, /example-package@2\.0\.0 → fresh-transitive@3\.0\.0/);
+  assert.match(result.stderr, /non-interactive/);
+  assert.doesNotMatch(result.workspace, /fresh-transitive/);
+  assert.equal(result.dependency, '^2.0.0');
+  assert.equal(result.lockfile, result.originalLockfile);
+});
+
+test('persists all confirmed exact blockers and completes resolution', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: '^2.0.0',
+    args: ['--exclude-newer', '2026-07-25', '--yes'],
+    config: { minimumReleaseAgeExclude: ['already-excluded'] },
+    blockers: [
+      {
+        name: 'first-transitive',
+        version: '3.0.0',
+        publishedAt: '2026-07-26T00:00:00.000Z',
+      },
+      {
+        name: 'second-transitive',
+        version: '4.0.0',
+        publishedAt: '2026-07-27T00:00:00.000Z',
+        parents: [
+          { name: 'nested-parent', version: '5.0.0' },
+          { name: 'example-package', version: '2.0.0' },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.workspace, /already-excluded/);
+  assert.match(result.workspace, /first-transitive@3\.0\.0/);
+  assert.match(result.workspace, /second-transitive@4\.0\.0/);
+  assert.match(result.stderr, /example-package@2\.0\.0 → nested-parent@5\.0\.0 → second-transitive@4\.0\.0/);
+  assert.equal(result.lockfile, 'lockfileVersion: "9.0"\ngenerated: true\n');
+});
+
+test('does not offer a missing version that was not hidden by the age policy', async (t) => {
+  const result = await runFixture(t, {
+    blockers: [{
+      name: 'missing-transitive',
+      version: '9.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+      available: false,
+    }],
+  });
+
+  assert.equal(result.code, 1);
+  assert.doesNotMatch(result.stderr, /Add exact exclusions/);
+  assert.doesNotMatch(result.workspace, /missing-transitive/);
+});
+
+test('restores approved exclusions when final verification fails', async (t) => {
+  const result = await runFixture(t, {
+    args: ['--exclude-newer', '2026-07-25', '--yes'],
+    blockers: [{
+      name: 'fresh-transitive',
+      version: '3.0.0',
+      publishedAt: '2026-07-27T00:00:00.000Z',
+    }],
+    verify: true,
+    finalCode: 42,
+  });
+
+  assert.equal(result.code, 42);
+  assert.doesNotMatch(result.workspace, /fresh-transitive/);
   assert.equal(result.lockfile, result.originalLockfile);
 });

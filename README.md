@@ -1,115 +1,75 @@
 # pnpm-exclude-newer
 
-**NOTE**: This script is 100% generated. Use at your own risk.
+Generate a pnpm lockfile in which every registry dependency, including transitive dependencies, predates a cutoff unless explicitly excluded. It is similar to [uv's `--exclude-newer`][1], but for pnpm.
 
-Bring a pnpm project up to the latest versions that are old enough to trust: every non-excluded
-dependency — direct **and transitive** — capped to what was published before a cutoff. Think
-[uv's `--exclude-newer`][1], or a **transitive** `minimumReleaseAge`, for pnpm.
+By default, the command also updates simple direct dependency ranges to the latest allowed version while keeping their `^` or `~` prefix. Use `--no-bump` to leave `package.json` unchanged.
 
-By default it rewrites each direct dep range in `package.json` to the latest allowed version
-(mature or listed in `minimumReleaseAgeExclude`, while keeping its `^`/`~` operator) and resolves
-an age-capped lockfile. Pass `--no-bump` to leave `package.json` alone and only resolve the
-lockfile within the existing ranges.
+## Usage
 
 ```sh
-pnpm dlx @webpro/pnpm-exclude-newer            # cutoff from effective pnpm minimumReleaseAge (else 1 day)
-pnpm dlx @webpro/pnpm-exclude-newer --age 4320 # 3 days
+pnpm dlx @webpro/pnpm-exclude-newer
+pnpm dlx @webpro/pnpm-exclude-newer --age 4320
 pnpm dlx @webpro/pnpm-exclude-newer --exclude-newer 2026-05-30
-pnpm dlx @webpro/pnpm-exclude-newer --no-bump  # lockfile only, don't touch package.json
+pnpm dlx @webpro/pnpm-exclude-newer --no-bump
 ```
 
-## Why this exists
+Without an explicit cutoff, the command uses the effective pnpm `minimumReleaseAge`, or 1440 minutes if none is configured.
 
-pnpm's [`minimumReleaseAge`][2] is **verify-only**: the
-resolver picks the latest in-range version and then _rejects_ it if it's too fresh
-(`ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION` / `ERR_PNPM_NO_MATURE_MATCHING_VERSION`) — it does **not**
-fall back to the latest _mature_ version. `resolutionMode: time-based` is meant to do age-aware
-resolution but is broken when combined with `minimumReleaseAge`. So out of the box you can't get a
-lockfile that's mature _all the way down_, and the escape hatches are all exclusion-based.
+## Why
 
-Related pnpm issues:
-[#10257][3] (time-based ignored),
-[#11068][4] (transitive deps error out),
-[#11203][5] (no intermediate fallback),
-[#10488][6] (excludes don't cascade).
+pnpm's [`minimumReleaseAge`][2] checks the selected version but does not reliably fall back to the newest mature version. This can leave a valid mature version unused or fail on a fresh transitive dependency. `resolutionMode: time-based` also has unresolved interactions with the age policy.
 
-## How it compares
+Since pnpm 11.1.3, strict mode [collects immature direct and transitive versions and asks once before excluding them][3]. That fixes the discovery loop, but accepts the fresh versions instead of finding a fully mature dependency tree. The resolver gaps remain open: [time-based resolution is ignored][4], [fresh transitive dependencies block resolution][5], and [mature intermediate versions are skipped][6].
 
-Cooldown / min-release-age features that work at the **manifest or PR layer** only gate **direct**
-dependencies — your package manager still resolves the transitive tree to the freshest versions at
-install time:
-
-| Tool                                               | Operates on             |        Direct        | Transitive  |
-| -------------------------------------------------- | ----------------------- | :------------------: | :---------: |
-| [`npm-check-updates --cooldown`][7]                | rewrites `package.json` |          ✅          |     ❌      |
-| Renovate `minimumReleaseAge` / Dependabot cooldown | opens PRs               |          ✅          |     ❌      |
-| pnpm [`minimumReleaseAge`][2]                      | resolve + verify        | ⚠️ `latest`-tag only | ❌ (errors) |
-| **`pnpm-exclude-newer`**                           | **registry resolution** |          ✅          |     ✅      |
-
-Verified: `ncu --cooldown 3` on a project with a single direct dependency correctly cools that
-dependency, yet its lockfile still contained a transitive dependency published 2 days earlier.
-`pnpm-exclude-newer` on the same project left zero entries younger than the cutoff. Only
-resolution-level filtering reaches transitive dependencies.
+This command filters registry metadata before pnpm resolves the dependency graph. pnpm therefore sees only versions allowed by the cutoff.
 
 ## How it works
 
-1. Stands up a throwaway local registry **mirror** that hides every non-excluded version published
-   on/after the cutoff. It preserves the upstream `latest` tag when allowed; when that version is
-   too fresh, it moves the tag back below that version instead of promoting a higher version from
-   another tag.
-   `minimumReleaseAgeExclude` is read through pnpm config and supports package names, patterns, and
-   exact-version selectors.
-2. Unless `--no-bump`, rewrites each direct dep range in your `package.json`(s) to that latest
-   allowed version — preserving the `^`/`~` operator. This both **updates** stale ranges and
-   **lowers** any whose floor is too fresh to have a mature match (e.g. `^1.69.0` → `^1.68.0`),
-   which would otherwise error. Non-registry specs (`workspace:`, `catalog:`, `file:`, git, URL,
-   `npm:` aliases, `*`, complex ranges) are left untouched.
-3. Copies the workspace-member manifests (asked from pnpm, so the `packages` globs and their
-   negations are honored — test fixtures and other nested `package.json`s are skipped) into a
-   clean temp tree (your `node_modules` would otherwise leak fresh peer versions), copies a sanitized
-   project `.npmrc`, and runs `pnpm install --lockfile-only` against the mirror — so pnpm's _normal_
-   resolver produces a transitively age-capped tree.
-4. Normalizes registry tarball URLs out of the generated lockfile, copies it back, and runs
-   `pnpm install --frozen-lockfile`, letting pnpm's own gate verify it without mutating the result.
+1. Start a local registry mirror that hides versions published on or after the cutoff. Configured `minimumReleaseAgeExclude` package names, patterns, and exact versions remain visible.
+2. Update simple direct ranges unless `--no-bump` is set. An allowed current floor is never lowered just because it is above the upstream `latest` tag. A floor hidden by the cutoff is lowered to the newest allowed version.
+3. Resolve the workspace in a clean temporary directory. The copy includes workspace manifests, pnpm hooks, patches, and non-registry `.npmrc` settings.
+4. Collect exact dependencies that were hidden by the age filter but are required by the selected graph. Ask for approval before adding them to the project `minimumReleaseAgeExclude`.
+5. Remove mirror tarball URLs from the generated lockfile, copy it back, and run `pnpm install --frozen-lockfile`.
 
-Real integrity hashes come straight from the upstream registry, so the lockfile stays portable and
-keeps pnpm's usual shape. If resolution or final verification fails, `package.json` bumps and the
-previous lockfile are restored.
+Package integrity hashes still come from the upstream registry. If resolution or final verification fails, the command restores the manifests, project configuration, and previous lockfile.
+
+## Confirming fresh dependencies
+
+Exclusions do not cascade. For example, excluding `release-it` allows its newest version, but not a fresh exact version of `undici` that it requires.
+
+The command resolves in its temporary workspace until it has collected every exact blocker, then prints the evidence:
+
+```text
+undici@7.29.0
+  path: release-it@21.0.0 → undici@7.29.0
+  published: 2026-07-24T12:52:58.701Z; matures in 6h 30m
+```
+
+An interactive run asks once before adding the exact versions. Rejecting the prompt leaves the project unchanged. Non-interactive runs fail closed; pass `--yes` only after reviewing the reported versions and dependency paths.
+
+Exact exclusions are not removed automatically after they mature. Remove entries that are no longer intentional; pnpm is [tracking a cleanup command][7].
 
 ## Options
 
-| flag                     | meaning                                                                                       |
-| ------------------------ | --------------------------------------------------------------------------------------------- |
-| `--exclude-newer <date>` | hide versions published on/after `<date>` (e.g. `2026-05-30`)                                 |
-| `--age <minutes>`        | cutoff = now − minutes (default: effective pnpm `minimumReleaseAge`, else `1440`)             |
-| `--no-bump`              | don't rewrite `package.json`; only resolve the lockfile within the existing ranges            |
-| `--no-install`           | stop after writing the lockfile (skip the verifying install)                                  |
-| `-h`, `--help`           | usage                                                                                         |
+| Flag                     | Meaning                                                                            |
+| ------------------------ | ---------------------------------------------------------------------------------- |
+| `--exclude-newer <date>` | Hide versions published on or after the given date.                                |
+| `--age <minutes>`        | Set the minimum age in minutes.                                                     |
+| `--no-bump`              | Keep `package.json` ranges unchanged.                                               |
+| `--no-install`           | Write the lockfile without running the final frozen install.                       |
+| `--yes`                  | Approve collected exact-version exclusions without prompting.                      |
+| `-h`, `--help`           | Show help.                                                                         |
 
-If a resolution fails, a selected package may depend on a still-too-fresh exact version. Wait for
-it to age, or add that exact version to `minimumReleaseAgeExclude` only if you trust it.
+## Requirements and limitations
 
-## Requirements & limitations
-
-- Node ≥ 18 (global `fetch`) and `pnpm` on `PATH`.
-- **pnpm version**: resolves with whatever `pnpm` is on `PATH` (under corepack, the repo's
-  `packageManager` pin — recommended for fidelity). A mismatch can change resolution; e.g. pnpm 11
-  ignores the `pnpm` field in `package.json`, so on an older repo that keeps
-  `overrides`/`patchedDependencies` there, run it under the matching pnpm.
-- **Registries**: only the default registry is mirrored (read with `pnpm config get registry`, with
-  its `_authToken` from `.npmrc`). Scoped and named registries are rejected before mutation because
-  they would route packages around the mirror.
-- **Config fidelity**: the isolated install copies `package.json`(s), `pnpm-workspace.yaml`,
-  `.pnpmfile.cjs`/`pnpmfile.cjs`, `patches/`, and non-registry project `.npmrc` settings. Registry,
-  auth, minimum-release-age, and `resolution-mode=time-based` entries are stripped in the temp tree.
-  The effective `minimumReleaseAgeExclude` list is read before this sanitization and applied by the
-  mirror.
-- `shared-workspace-lockfile=false` (per-package lockfiles) isn't supported.
-- **Non-registry deps** (git, tarball URL, `file:`, `link:`, `workspace:`) have no published-version
-  concept and aren't age-filtered — they resolve as usual.
-- If an `overrides` / catalog / `patchedDependencies` entry pins an _exact_ version newer than the
-  cutoff, resolution fails (the mirror hides it) — age the pin or raise the cutoff.
-- Versions the registry has no publish `time` for are treated as too-new (excluded).
+- Requires Node.js 18 or newer and pnpm on `PATH`.
+- Uses the pnpm version on `PATH`. Prefer the version pinned by the repository because pnpm versions can interpret resolution settings differently.
+- Currently supports macOS and Linux. Windows still needs explicit handling for `pnpm.cmd` and its temporary directory.
+- Mirrors only the default registry. Scoped and named registries are rejected because they would bypass the mirror.
+- Supports a shared workspace lockfile only. `shared-workspace-lockfile=false` is not supported.
+- Does not age-filter git, URL, `file:`, `link:`, or `workspace:` dependencies.
+- Treats registry versions without a publish time as unavailable.
+- Leaves `workspace:`, `catalog:`, `file:`, git, URL, `npm:` aliases, wildcards, and complex direct ranges unchanged.
 
 ## License
 
@@ -117,8 +77,8 @@ MIT
 
 [1]: https://docs.astral.sh/uv/reference/settings/#exclude-newer
 [2]: https://pnpm.io/settings#minimumreleaseage
-[3]: https://github.com/pnpm/pnpm/issues/10257
-[4]: https://github.com/pnpm/pnpm/issues/11068
-[5]: https://github.com/pnpm/pnpm/issues/11203
-[6]: https://github.com/pnpm/pnpm/issues/10488
-[7]: https://github.com/raineorshine/npm-check-updates#cooldown
+[3]: https://github.com/pnpm/pnpm/pull/11705
+[4]: https://github.com/pnpm/pnpm/issues/10257
+[5]: https://github.com/pnpm/pnpm/issues/11068
+[6]: https://github.com/pnpm/pnpm/issues/11203
+[7]: https://github.com/pnpm/pnpm/issues/11668

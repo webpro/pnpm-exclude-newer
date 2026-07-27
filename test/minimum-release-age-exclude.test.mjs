@@ -63,7 +63,7 @@ if (args[0] === 'config' && args[1] === 'get') {
   else if (args[2] === 'minimumReleaseAgeExclude') console.log(process.env.FAKE_EXCLUDES);
 } else if (args[0] === 'list') {
   console.log(JSON.stringify([{ path: process.cwd() }]));
-} else if (args[0] === 'install' && args.includes('--lockfile-only')) {
+} else if (args[0] === '--reporter=ndjson' && args[1] === 'install' && args.includes('--lockfile-only')) {
   writeFileSync('pnpm-lock.yaml', 'lockfileVersion: "9.0"\\n');
 } else {
   process.exitCode = 1;
