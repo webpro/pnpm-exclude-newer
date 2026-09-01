@@ -68,7 +68,7 @@ Exact exclusions are not removed automatically after they mature. Remove entries
 - Requires Node.js 18 or newer and pnpm on `PATH`.
 - Uses the pnpm version on `PATH`. Prefer the version pinned by the repository because pnpm versions can interpret resolution settings differently.
 - Currently supports macOS and Linux. Windows still needs explicit handling for `pnpm.cmd` and its temporary directory.
-- Mirrors only the default registry. Scoped and named registries are rejected because they would bypass the mirror.
+- Mirrors only the default registry. A scoped or prefixed registry, including `namedRegistries`, is rejected only when the resolved dependency graph uses it.
 - Supports a shared workspace lockfile only. `shared-workspace-lockfile=false` is not supported.
 - Does not age-filter git, URL, `file:`, `link:`, or `workspace:` dependencies.
 - Treats registry versions without a publish time as unavailable.

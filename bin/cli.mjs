@@ -116,15 +116,32 @@ if (namedRegistries !== undefined && !isRecord(namedRegistries)) {
   console.error('pnpm-exclude-newer: pnpm config namedRegistries must be an object');
   process.exit(1);
 }
-const scopedRegistries = Object.keys(registries ?? {}).filter((name) => name !== 'default');
-if (scopedRegistries.length) {
-  console.error(`pnpm-exclude-newer: scoped registries are not supported because they bypass the mirror: ${scopedRegistries.join(', ')}`);
-  process.exit(1);
+// pnpm >=11.23 reports `registries` keyed by registry URL ({ scopes, prefix }) and always ships
+// built-ins for jsr, GitHub Packages and npmjs; older config shapes use { default: url, '@scope': url }.
+// The '@' scope is the catch-all, i.e. the default registry, which `--registry` redirects to the mirror.
+function normalizeRegistries(value) {
+  const scopes = new Map();
+  const prefixes = new Map();
+  let defaultUrl;
+  for (const [key, entry] of Object.entries(value ?? {})) {
+    if (typeof entry === 'string') {
+      if (key === 'default') defaultUrl = entry;
+      else scopes.set(key, entry);
+      continue;
+    }
+    if (!isRecord(entry)) continue;
+    for (const scope of entry.scopes ?? []) {
+      if (scope === '@') defaultUrl ??= key;
+      else scopes.set(scope, key);
+    }
+    if (typeof entry.prefix === 'string') prefixes.set(entry.prefix, key);
+  }
+  for (const [prefix, url] of Object.entries(namedRegistries ?? {})) {
+    if (!prefixes.has(prefix) && typeof url === 'string') prefixes.set(prefix, url);
+  }
+  return { defaultUrl, scopes, prefixes };
 }
-if (Object.keys(namedRegistries ?? {}).length) {
-  console.error('pnpm-exclude-newer: named registries are not supported because they bypass the mirror');
-  process.exit(1);
-}
+const { defaultUrl: defaultRegistry, scopes: scopeRegistries, prefixes: prefixRegistries } = normalizeRegistries(registries);
 
 // ---- cutoff ----
 if (has('--age') && has('--exclude-newer')) {
@@ -198,7 +215,7 @@ try {
 }
 
 // ---- upstream registry + auth (respect npm config / .npmrc) ----
-const registryConfig = registries?.default ?? configuredRegistry ?? 'https://registry.npmjs.org';
+const registryConfig = defaultRegistry ?? configuredRegistry ?? 'https://registry.npmjs.org';
 if (typeof registryConfig !== 'string' || !/^https?:\/\//.test(registryConfig)) {
   console.error(`pnpm-exclude-newer: invalid registry URL: ${registryConfig}`);
   process.exit(1);
@@ -710,6 +727,47 @@ if (pendingBlockers.length) {
     resolution = await resolveWithMatureDirectFallbacks();
     if (!resolutionSucceeded(resolution)) failResolution(resolution);
   }
+}
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const failRegistryGate = (message) => {
+  server.close();
+  restoreRoot();
+  rmSync(tmp, { recursive: true, force: true });
+  console.error(`pnpm-exclude-newer: ${message}`);
+  process.exit(1);
+};
+const resolvedPackageKeys = (() => {
+  try {
+    const keys = [];
+    let inPackages = false;
+    for (const line of readFileSync(generated, 'utf8').split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      if (!line.startsWith(' ')) {
+        inPackages = line === 'packages:';
+        continue;
+      }
+      if (!inPackages || !line.startsWith('  ') || line.startsWith('   ') || !line.endsWith(':')) continue;
+      let key = line.slice(2, -1);
+      if ((key.startsWith("'") && key.endsWith("'")) || (key.startsWith('"') && key.endsWith('"'))) key = key.slice(1, -1);
+      keys.push(key);
+    }
+    return keys;
+  } catch (error) {
+    failRegistryGate(`could not inspect the generated lockfile: ${error.message}`);
+  }
+})();
+const blockedScopes = [...scopeRegistries.keys()].filter((scope) =>
+  resolvedPackageKeys.some((key) => key.startsWith(`${scope}/`) || key.startsWith(`/${scope}/`)));
+if (blockedScopes.length) {
+  failRegistryGate(`scoped registries are not supported because they bypass the mirror: ${blockedScopes.join(', ')}`);
+}
+const blockedPrefixes = [...prefixRegistries.keys()].filter((prefix) => {
+  const marker = new RegExp(`@${escapeRegExp(prefix)}:`);
+  return resolvedPackageKeys.some((key) => marker.test(key));
+});
+if (blockedPrefixes.length) {
+  failRegistryGate(`prefixed registries are not supported because they bypass the mirror: ${blockedPrefixes.join(', ')}`);
 }
 server.close();
 

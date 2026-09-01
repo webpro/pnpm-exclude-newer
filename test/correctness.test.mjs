@@ -149,10 +149,11 @@ if (args[0] === 'config' && args[1] === 'get') {
   await writeFile(join(fixture, 'pnpm-lock.yaml'), originalLockfile);
 
   const address = registry.address();
+  const registryUrl = `http://127.0.0.1:${address.port}`;
   const config = {
-    registry: `http://127.0.0.1:${address.port}`,
+    registry: registryUrl,
     minimumReleaseAgeExclude: [],
-    ...options.config,
+    ...(typeof options.config === 'function' ? options.config(registryUrl) : options.config),
   };
   const args = [...(options.args ?? ['--exclude-newer', '2026-07-25'])];
   if (options.verify !== true) args.push('--no-install');
@@ -167,7 +168,7 @@ if (args[0] === 'config' && args[1] === 'get') {
         parents: blocker.parents ?? [{ name: packageName, version: options.latest ?? versions.at(-1).version }],
       }))),
       FAKE_FINAL_CODE: String(options.finalCode ?? 0),
-      FAKE_GENERATED_LOCKFILE: 'lockfileVersion: "9.0"\ngenerated: true\n',
+      FAKE_GENERATED_LOCKFILE: options.generatedLockfile ?? 'lockfileVersion: "9.0"\ngenerated: true\n',
       FAKE_SILENT_RESOLUTION_FAILURE: options.silentResolutionFailure ? '1' : '0',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -247,12 +248,159 @@ test('combines separate exact-version exclusions for one package', async (t) => 
 
 test('rejects scoped registries that would bypass the mirror', async (t) => {
   const result = await runFixture(t, {
+    packageName: '@private/example-package',
     config: { registries: { '@private': 'https://registry.example.com/' } },
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  "@private/example-package@1.0.0":\n    resolution: {}\n',
   });
 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /scoped registries are not supported/);
   assert.equal(result.dependency, '^1.0.0');
+});
+
+test('rejects a used scoped registry in the pnpm >=11 registries shape', async (t) => {
+  const result = await runFixture(t, {
+    packageName: '@private/example-package',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  "@private/example-package@1.0.0":\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'] },
+        'https://registry.example.com/': { scopes: ['@private'] },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /scoped registries are not supported/);
+  assert.equal(result.dependency, '^1.0.0');
+});
+
+test("proceeds past pnpm's built-in registries when nothing depends on their scopes", async (t) => {
+  const result = await runFixture(t, {
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'] },
+        'https://npm.jsr.io/': { scopes: ['@jsr'] },
+        'https://npm.pkg.github.com/': { prefix: 'gh' },
+        'https://registry.npmjs.org/': { prefix: 'npmjs' },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.dependency, '^2.0.0');
+});
+
+test('rejects a prefixed registry when a dependency uses its prefix', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: 'gh:example/example-package',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  example-package@gh:1.0.0:\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'] },
+        'https://npm.pkg.github.com/': { prefix: 'gh' },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /prefixed registries are not supported/);
+});
+
+test('rejects a used prefix even when it points to the default registry origin', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: 'npmjs:1.0.0',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  example-package@npmjs:1.0.0:\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'], prefix: 'npmjs' },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /prefixed registries are not supported/);
+});
+
+test('does not confuse a package scope with a similarly named registry prefix', async (t) => {
+  const result = await runFixture(t, {
+    packageName: '@private/example-package',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  "@private/example-package@1.0.0":\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'], prefix: 'private' },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test('rejects a scoped registry used only by a newly resolved transitive dependency', async (t) => {
+  const result = await runFixture(t, {
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  "@private/transitive@1.0.0":\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'] },
+        'https://registry.example.com/': { scopes: ['@private'] },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /scoped registries are not supported/);
+});
+
+test('rejects a scoped registry selected by an npm alias target', async (t) => {
+  const result = await runFixture(t, {
+    packageName: 'validator',
+    initialSpec: 'npm:@private/example-package@1.0.0',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  "@private/example-package@1.0.0":\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'] },
+        'https://registry.example.com/': { scopes: ['@private'] },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /scoped registries are not supported/);
+});
+
+test('allows an unscoped npm alias target under a scoped local name', async (t) => {
+  const result = await runFixture(t, {
+    packageName: '@private/local-name',
+    initialSpec: 'npm:example-package@1.0.0',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  example-package@1.0.0:\n    resolution: {}\n',
+    config: (registryUrl) => ({
+      registries: {
+        [registryUrl]: { scopes: ['@'] },
+        'https://registry.example.com/': { scopes: ['@private'] },
+      },
+    }),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test('allows an unused legacy named registry', async (t) => {
+  const result = await runFixture(t, {
+    config: { namedRegistries: { work: 'https://registry.example.com/' } },
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+});
+
+test('rejects a used legacy named registry as a prefixed route', async (t) => {
+  const result = await runFixture(t, {
+    initialSpec: 'work:1.0.0',
+    generatedLockfile: 'lockfileVersion: "9.0"\npackages:\n  example-package@work:1.0.0:\n    resolution: {}\n',
+    config: { namedRegistries: { work: 'https://registry.example.com/' } },
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /prefixed registries are not supported/);
 });
 
 test('restores manifests and lockfile when final verification fails', async (t) => {
