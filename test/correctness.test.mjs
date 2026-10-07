@@ -246,6 +246,27 @@ test('combines separate exact-version exclusions for one package', async (t) => 
   assert.equal(result.dependency, '^2.0.0');
 });
 
+for (const key of ['registries', 'namedRegistries']) {
+  test(`treats null ${key} as unset`, async (t) => {
+    const result = await runFixture(t, { config: { [key]: null } });
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.dependency, '^2.0.0');
+    assert.equal(result.lockfile, 'lockfileVersion: "9.0"\ngenerated: true\n');
+  });
+
+  for (const value of ['https://registry.example.com/', []]) {
+    test(`rejects malformed ${key}: ${JSON.stringify(value)}`, async (t) => {
+      const result = await runFixture(t, { config: { [key]: value } });
+
+      assert.equal(result.code, 1);
+      assert.equal(result.stderr, `pnpm-exclude-newer: pnpm config ${key} must be an object\n`);
+      assert.equal(result.dependency, '^1.0.0');
+      assert.equal(result.lockfile, 'lockfileVersion: "9.0"\noriginal: true\n');
+    });
+  }
+}
+
 test('rejects scoped registries that would bypass the mirror', async (t) => {
   const result = await runFixture(t, {
     packageName: '@private/example-package',

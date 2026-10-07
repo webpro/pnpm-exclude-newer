@@ -82,7 +82,7 @@ function readPnpmConfig(key, options = []) {
   }
   if (!output.trim()) return undefined;
   try {
-    return JSON.parse(output);
+    return JSON.parse(output) ?? undefined;
   } catch {
     throw new Error(`pnpm config ${key} returned invalid JSON`);
   }
